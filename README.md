@@ -65,7 +65,9 @@ Press the shortcut again while the float is open to raise and focus the existing
 | `keep_open` | If true, after the command exits wait for Enter before closing |
 | `label` | Optional extra column in the fzf row |
 
-`keep_open: false` replaces the helper process with the program (`execv`). `keep_open: true` runs the command and leaves output visible until you press Enter.
+`keep_open: false` replaces the helper process with the program (`execve`). `keep_open: true` runs the command and leaves output visible until you press Enter.
+
+Launched programs inherit PATH with missing Homebrew and system fallback directories appended, so tools such as Neovim can also find dependencies like `fzf`. Commands run directly without loading shell startup files; custom PATH entries from your shell configuration require launching through that shell explicitly.
 
 ## Development
 

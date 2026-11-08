@@ -85,12 +85,18 @@ def _fallback_prefixes() -> list[str]:
     return [p.replace("{home}", home) for p in REX_SERVER_PATH_FALLBACKS]
 
 
-def find_in_path(name: str) -> str | None:
+def launch_env() -> dict[str, str]:
+    env = os.environ.copy()
     paths = os.environ.get("PATH", "")
     for prefix in _fallback_prefixes():
         if prefix not in paths.split(os.pathsep):
             paths = paths + os.pathsep + prefix
-    return shutil.which(name, path=paths)
+    env["PATH"] = paths
+    return env
+
+
+def find_in_path(name: str) -> str | None:
+    return shutil.which(name, path=launch_env()["PATH"])
 
 
 def config_path() -> Path:
@@ -117,7 +123,7 @@ def absolute_path_from_file_url(raw: str) -> str | None:
 
 
 def fzf_subprocess_env() -> dict[str, str]:
-    env = os.environ.copy()
+    env = launch_env()
     env["FZF_DEFAULT_OPTS"] = ""
     return env
 
@@ -386,11 +392,12 @@ def prepare(launch: Launch, ctx: OpenContext) -> ResolvedLaunch:
 
 def exec_prepared(resolved: ResolvedLaunch) -> None:
     os.chdir(resolved.cwd)
+    env = launch_env()
     if not resolved.keep_open:
-        os.execv(resolved.argv[0], list(resolved.argv))
+        os.execve(resolved.argv[0], list(resolved.argv), env)
 
     try:
-        completed = subprocess.run(list(resolved.argv))
+        completed = subprocess.run(list(resolved.argv), env=env)
         code = completed.returncode
     except OSError as e:
         fail(f"failed to run {resolved.argv[0]!r}: {e}")
