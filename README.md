@@ -70,7 +70,7 @@ Press the shortcut again while the float is open to raise and focus the existing
 
 With `new_pane: true`, Enter opens a separate floating pane for the command and dismisses the quick-launch picker. `keep_open: false` closes that pane when the command exits (`exit.on_completion`); `keep_open: true` keeps it open after exit so you can read output (same idea as an agent session).
 
-Launched programs inherit PATH with missing Homebrew and system fallback directories appended, so tools such as Neovim can also find dependencies like `fzf`. Commands run directly without loading shell startup files; custom PATH entries from your shell configuration require launching through that shell explicitly.
+Launched programs inherit PATH with missing `~/.local/bin`, Homebrew, and system fallback directories appended, so tools such as `claude` or Neovim can resolve without a login shell. Commands run directly without loading shell startup files; custom PATH entries from your shell configuration require launching through that shell explicitly.
 
 ## Development
 
