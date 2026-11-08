@@ -17,6 +17,7 @@ FLOAT_BOUNDS = {"x": 0.25, "y": 0.15, "w": 0.5, "h": 0.7}
 
 
 REX_SERVER_PATH_FALLBACKS: tuple[str, ...] = (
+    "{home}/.local/bin",
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
