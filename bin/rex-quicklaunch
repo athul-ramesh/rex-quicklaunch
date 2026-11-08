@@ -8,8 +8,12 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any
+
+TERMINAL_SHELL = "com.superlogical.terminal.shell"
+FLOAT_BOUNDS = {"x": 0.25, "y": 0.15, "w": 0.5, "h": 0.7}
 
 
 REX_SERVER_PATH_FALLBACKS: tuple[str, ...] = (
@@ -43,13 +47,33 @@ class CwdHome:
     pass
 
 
+class HereWhenDone(Enum):
+    REPLACE = auto()
+    HOLD = auto()
+
+
+class FloatWhenDone(Enum):
+    CLOSE = auto()
+    STAY = auto()
+
+
+@dataclass(frozen=True)
+class PlaceHere:
+    when_done: HereWhenDone
+
+
+@dataclass(frozen=True)
+class PlaceFloat:
+    when_done: FloatWhenDone
+
+
 @dataclass(frozen=True)
 class Launch:
     name: str
     argv: tuple[str, ...]
     cwd: CwdFocused | CwdFixed | CwdHome
-    keep_open: bool
     label: str | None
+    place: PlaceHere | PlaceFloat
 
 
 @dataclass(frozen=True)
@@ -68,8 +92,8 @@ class OpenContext:
 class ResolvedLaunch:
     argv: tuple[str, ...]
     cwd: str
-    keep_open: bool
     display_name: str
+    place: PlaceHere | PlaceFloat
 
 
 class PickCancelled(Exception):
@@ -154,7 +178,7 @@ def _parse_launch(entry: Any, path: str, index: int) -> Launch:
     if not isinstance(entry, dict):
         _bad(path, f"launches[{index}] must be an object")
 
-    allowed = {"name", "argv", "cwd", "keep_open", "label"}
+    allowed = {"name", "argv", "cwd", "keep_open", "label", "new_pane"}
     extra = set(entry) - allowed
     if extra:
         _bad(path, f"launches[{index}] unknown keys: {', '.join(sorted(extra))}")
@@ -195,6 +219,13 @@ def _parse_launch(entry: Any, path: str, index: int) -> Launch:
             _bad(path, f"launches[{index}].keep_open must be a boolean")
         keep_open = ko
 
+    new_pane = False
+    if "new_pane" in entry:
+        np = entry["new_pane"]
+        if not isinstance(np, bool):
+            _bad(path, f"launches[{index}].new_pane must be a boolean")
+        new_pane = np
+
     label: str | None = None
     if "label" in entry:
         lab = entry["label"]
@@ -216,12 +247,19 @@ def _parse_launch(entry: Any, path: str, index: int) -> Launch:
             _bad(path, f"launches[{index}].cwd.path required for fixed policy")
         cwd = CwdFixed(directory=_expand_user(path_val))
 
+    if new_pane:
+        when_done = FloatWhenDone.STAY if keep_open else FloatWhenDone.CLOSE
+        place: PlaceHere | PlaceFloat = PlaceFloat(when_done=when_done)
+    else:
+        when_done_here = HereWhenDone.HOLD if keep_open else HereWhenDone.REPLACE
+        place = PlaceHere(when_done=when_done_here)
+
     return Launch(
         name=name,
         argv=tuple(argv),
         cwd=cwd,
-        keep_open=keep_open,
         label=label,
+        place=place,
     )
 
 
@@ -385,15 +423,100 @@ def prepare(launch: Launch, ctx: OpenContext) -> ResolvedLaunch:
     return ResolvedLaunch(
         argv=tuple(argv),
         cwd=run_cwd,
-        keep_open=launch.keep_open,
         display_name=launch.name,
+        place=launch.place,
     )
 
 
-def exec_prepared(resolved: ResolvedLaunch) -> None:
+def path_prepend_dirs() -> list[str]:
+    seen: set[str] = set()
+    dirs: list[str] = []
+    for part in launch_env()["PATH"].split(os.pathsep):
+        if part and part not in seen:
+            seen.add(part)
+            dirs.append(part)
+    return dirs
+
+
+def shell_block_options(resolved: ResolvedLaunch) -> dict[str, Any]:
+    if not isinstance(resolved.place, PlaceFloat):
+        raise TypeError("shell_block_options requires PlaceFloat")
+    on_completion = resolved.place.when_done == FloatWhenDone.CLOSE
+    options: dict[str, Any] = {
+        "command": list(resolved.argv),
+        "cwd": resolved.cwd,
+        "shell": "none",
+        "exit": {"on_completion": on_completion},
+    }
+    prepend = path_prepend_dirs()
+    if prepend:
+        options["path_prepend"] = prepend
+    return options
+
+
+def rex_api_call(
+    session_id: str, method: str, args: dict[str, Any] | None = None
+) -> tuple[bool, str]:
+    rex = find_in_path("rex")
+    if rex is None:
+        return False, "rex not found on PATH"
+
+    argv = [rex, "api", "call", "-s", session_id, method]
+    if args is not None:
+        argv.append(json.dumps(args))
+
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            env=launch_env(),
+        )
+    except OSError as e:
+        return False, str(e)
+
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "").strip()
+        if not err:
+            err = f"rex api call {method} exited {completed.returncode}"
+        return False, err
+    return True, (completed.stdout or "").strip()
+
+
+def dismiss_picker(session_id: str) -> tuple[bool, str]:
+    block_id = os.environ.get("REX_BLOCK")
+    if not block_id:
+        return False, "REX_BLOCK is not set; cannot close the quick launch picker"
+
+    rex = find_in_path("rex")
+    if rex is None:
+        return False, "rex not found on PATH"
+
+    try:
+        completed = subprocess.run(
+            [rex, "block", "close", block_id, "-s", session_id],
+            capture_output=True,
+            text=True,
+            env=launch_env(),
+        )
+    except OSError as e:
+        return False, str(e)
+
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "").strip()
+        if not err:
+            err = f"rex block close exited {completed.returncode}"
+        return False, err
+    return True, ""
+
+
+def exec_place_here(resolved: ResolvedLaunch) -> None:
+    if not isinstance(resolved.place, PlaceHere):
+        raise TypeError("exec_place_here requires PlaceHere")
+
     os.chdir(resolved.cwd)
     env = launch_env()
-    if not resolved.keep_open:
+    if resolved.place.when_done == HereWhenDone.REPLACE:
         os.execve(resolved.argv[0], list(resolved.argv), env)
 
     try:
@@ -407,6 +530,41 @@ def exec_prepared(resolved: ResolvedLaunch) -> None:
         print(f"\nExit code {code}", flush=True)
     wait_for_enter()
     raise SystemExit(0)
+
+
+def exec_place_float(resolved: ResolvedLaunch, session_id: str) -> None:
+    if not isinstance(resolved.place, PlaceFloat):
+        raise TypeError("exec_place_float requires PlaceFloat")
+
+    if not os.environ.get("REX_BLOCK"):
+        fail("REX_BLOCK is not set; cannot close the quick launch picker")
+
+    payload = {
+        "bounds": FLOAT_BOUNDS,
+        "focus": True,
+        "layout": {
+            "block": {
+                "flavor": TERMINAL_SHELL,
+                "label": resolved.display_name,
+                "options": shell_block_options(resolved),
+            },
+        },
+    }
+    ok, err = rex_api_call(session_id, "session.new_layer", payload)
+    if not ok:
+        fail(f"failed to open new pane for {resolved.display_name!r}: {err}")
+
+    dismissed, derr = dismiss_picker(session_id)
+    if not dismissed:
+        print(f"warning: {derr}", file=sys.stderr, flush=True)
+    raise SystemExit(0)
+
+
+def run_resolved(resolved: ResolvedLaunch, session_id: str) -> None:
+    if isinstance(resolved.place, PlaceHere):
+        exec_place_here(resolved)
+    else:
+        exec_place_float(resolved, session_id)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -452,7 +610,7 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as e:
         fail(str(e))
 
-    exec_prepared(resolved)
+    run_resolved(resolved, ctx.session_id)
 
 
 if __name__ == "__main__":
