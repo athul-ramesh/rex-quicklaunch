@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "lazygit",
+      "argv": ["lazygit"],
+      "cwd": { "policy": "focused" }
+    },
+    {
+      "name": "build",
+      "argv": ["make", "build"],
+      "cwd": { "policy": "focused" },
+      "keep_open": true
+    },
+    {
+      "name": "htop",
+      "argv": ["htop"],
+      "cwd": { "policy": "home" }
+    }
+  ]
+}

@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+REX_SERVER_PATH_FALLBACKS: tuple[str, ...] = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "{home}/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS",
+)
+
+
+class ConfigError(Exception):
+    def __init__(self, path: str, message: str) -> None:
+        self.path = path
+        self.message = message
+        super().__init__(f"{path}: {message}")
+
+
+@dataclass(frozen=True)
+class CwdFocused:
+    pass
+
+
+@dataclass(frozen=True)
+class CwdFixed:
+    directory: str
+
+
+@dataclass(frozen=True)
+class CwdHome:
+    pass
+
+
+@dataclass(frozen=True)
+class Launch:
+    name: str
+    argv: tuple[str, ...]
+    cwd: CwdFocused | CwdFixed | CwdHome
+    keep_open: bool
+    label: str | None
+
+
+@dataclass(frozen=True)
+class Registry:
+    launches: tuple[Launch, ...]
+
+
+@dataclass(frozen=True)
+class OpenContext:
+    session_id: str
+    block_id: str
+    focused_cwd: str | None
+
+
+@dataclass(frozen=True)
+class ResolvedLaunch:
+    argv: tuple[str, ...]
+    cwd: str
+    keep_open: bool
+    display_name: str
+
+
+class PickCancelled(Exception):
+    pass
+
+
+def _home() -> str:
+    return os.environ.get("HOME") or str(Path.home())
+
+
+def _fallback_prefixes() -> list[str]:
+    home = _home()
+    return [p.replace("{home}", home) for p in REX_SERVER_PATH_FALLBACKS]
+
+
+def find_in_path(name: str) -> str | None:
+    paths = os.environ.get("PATH", "")
+    for prefix in _fallback_prefixes():
+        if prefix not in paths.split(os.pathsep):
+            paths = paths + os.pathsep + prefix
+    return shutil.which(name, path=paths)
+
+
+def config_path() -> Path:
+    raw = os.environ.get("REX_QUICKLAUNCH_CONFIG")
+    if raw:
+        return Path(raw).expanduser()
+    return Path(_home()) / ".config/rex/quicklaunch.json"
+
+
+def absolute_path_from_file_url(raw: str) -> str | None:
+    if raw == "":
+        return None
+    path = raw
+    if path.startswith("file://"):
+        path = path[len("file://") :]
+        if not path.startswith("/"):
+            slash = path.find("/")
+            if slash < 0:
+                return None
+            path = path[slash:]
+    if not os.path.isabs(path):
+        return None
+    return path
+
+
+def fzf_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["FZF_DEFAULT_OPTS"] = ""
+    return env
+
+
+def wait_for_enter() -> None:
+    print("\nPress Enter to close… ", end="", flush=True)
+    try:
+        sys.stdin.readline()
+    except (OSError, EOFError):
+        pass
+
+
+def fail(message: str) -> None:
+    print(message, flush=True)
+    wait_for_enter()
+    raise SystemExit(0)
+
+
+def _bad(path: str, msg: str) -> None:
+    raise ConfigError(path, msg)
+
+
+def _expand_user(path: str) -> str:
+    return os.path.expanduser(path)
+
+
+def _parse_launch(entry: Any, path: str, index: int) -> Launch:
+    if not isinstance(entry, dict):
+        _bad(path, f"launches[{index}] must be an object")
+
+    allowed = {"name", "argv", "cwd", "keep_open", "label"}
+    extra = set(entry) - allowed
+    if extra:
+        _bad(path, f"launches[{index}] unknown keys: {', '.join(sorted(extra))}")
+
+    name = entry.get("name")
+    if not isinstance(name, str) or not name:
+        _bad(path, f"launches[{index}].name must be a non-empty string")
+    if any(c in name for c in "\t\n\0"):
+        _bad(path, f"launches[{index}].name must not contain tab, newline, or NUL")
+
+    argv_raw = entry.get("argv")
+    if not isinstance(argv_raw, list) or len(argv_raw) == 0:
+        _bad(path, f"launches[{index}].argv must be a non-empty array of strings")
+    argv: list[str] = []
+    for j, part in enumerate(argv_raw):
+        if not isinstance(part, str) or part == "":
+            _bad(path, f"launches[{index}].argv[{j}] must be a non-empty string")
+        if "\0" in part:
+            _bad(path, f"launches[{index}].argv[{j}] must not contain NUL")
+        argv.append(part)
+
+    cwd_raw = entry.get("cwd")
+    if not isinstance(cwd_raw, dict):
+        _bad(path, f"launches[{index}].cwd must be an object")
+    cwd_allowed = {"policy", "path"}
+    cwd_extra = set(cwd_raw) - cwd_allowed
+    if cwd_extra:
+        _bad(path, f"launches[{index}].cwd unknown keys: {', '.join(sorted(cwd_extra))}")
+
+    policy = cwd_raw.get("policy")
+    if policy not in ("focused", "fixed", "home"):
+        _bad(path, f"launches[{index}].cwd.policy must be focused, fixed, or home")
+
+    keep_open = False
+    if "keep_open" in entry:
+        ko = entry["keep_open"]
+        if not isinstance(ko, bool):
+            _bad(path, f"launches[{index}].keep_open must be a boolean")
+        keep_open = ko
+
+    label: str | None = None
+    if "label" in entry:
+        lab = entry["label"]
+        if not isinstance(lab, str):
+            _bad(path, f"launches[{index}].label must be a string")
+        label = lab
+
+    if policy == "focused":
+        if "path" in cwd_raw:
+            _bad(path, f"launches[{index}].cwd.path is not allowed for focused policy")
+        cwd: CwdFocused | CwdFixed | CwdHome = CwdFocused()
+    elif policy == "home":
+        if "path" in cwd_raw:
+            _bad(path, f"launches[{index}].cwd.path is not allowed for home policy")
+        cwd = CwdHome()
+    else:
+        path_val = cwd_raw.get("path")
+        if not isinstance(path_val, str) or not path_val:
+            _bad(path, f"launches[{index}].cwd.path required for fixed policy")
+        cwd = CwdFixed(directory=_expand_user(path_val))
+
+    return Launch(
+        name=name,
+        argv=tuple(argv),
+        cwd=cwd,
+        keep_open=keep_open,
+        label=label,
+    )
+
+
+def load_registry(path: Path) -> Registry:
+    p = str(path)
+    if not path.is_file():
+        raise ConfigError(p, "file not found")
+
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ConfigError(p, f"invalid JSON: {e}") from e
+
+    if not isinstance(data, dict):
+        _bad(p, "root must be an object")
+
+    root_allowed = {"version", "launches"}
+    root_extra = set(data) - root_allowed
+    if root_extra:
+        _bad(p, f"unknown keys: {', '.join(sorted(root_extra))}")
+
+    version = data.get("version")
+    if version != 1:
+        _bad(p, 'version must be 1')
+
+    launches_raw = data.get("launches")
+    if not isinstance(launches_raw, list):
+        _bad(p, "launches must be an array")
+
+    launches: list[Launch] = []
+    seen_names: set[str] = set()
+    for i, entry in enumerate(launches_raw):
+        launch = _parse_launch(entry, p, i)
+        if launch.name in seen_names:
+            _bad(p, f"duplicate launch name: {launch.name!r}")
+        seen_names.add(launch.name)
+        launches.append(launch)
+
+    return Registry(launches=tuple(launches))
+
+
+def parse_context(argv: list[str]) -> OpenContext:
+    parser = argparse.ArgumentParser(
+        description="Rex quick-launch helper: fzf picker then exec a configured command.",
+    )
+    parser.add_argument("--session", required=True, help="Rex session id")
+    parser.add_argument("--block", required=True, help="Focused block id (may be empty)")
+    parser.add_argument(
+        "--focused-cwd",
+        required=True,
+        help="Directory of the focused pane when the float was created (may be empty)",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.session:
+        parser.error("--session must be non-empty")
+
+    focused = absolute_path_from_file_url(args.focused_cwd)
+    if args.focused_cwd and focused is None:
+        parser.error("--focused-cwd must be an absolute path or file:// URL")
+
+    return OpenContext(
+        session_id=args.session,
+        block_id=args.block,
+        focused_cwd=focused,
+    )
+
+
+def _fzf_row(index: int, launch: Launch) -> str:
+    if launch.label:
+        return f"{index}\t{launch.name}\t{launch.label}"
+    return f"{index}\t{launch.name}"
+
+
+def pick(registry: Registry, ctx: OpenContext) -> Launch:
+    fzf = find_in_path("fzf")
+    if fzf is None:
+        fail("fzf not found on PATH (try: brew install fzf)")
+
+    if ctx.focused_cwd:
+        cwd_note = ctx.focused_cwd
+    else:
+        cwd_note = "cwd unresolved"
+    header = f"session {ctx.session_id}  ·  {cwd_note}"
+
+    lines = [_fzf_row(i, launch) for i, launch in enumerate(registry.launches)]
+    stdin_data = "\n".join(lines)
+    if lines:
+        stdin_data += "\n"
+
+    argv = [
+        fzf,
+        "--ansi",
+        "--delimiter=\t",
+        "--with-nth=2..",
+        "--layout=reverse",
+        "--prompt=Launch> ",
+        f"--header={header}",
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            env=fzf_subprocess_env(),
+        )
+        out, _ = proc.communicate(input=stdin_data)
+    except OSError as e:
+        fail(f"fzf failed to start: {e}")
+
+    if proc.returncode in (1, 130):
+        raise PickCancelled()
+
+    if proc.returncode != 0:
+        fail(f"fzf exited with status {proc.returncode}")
+
+    line = (out or "").strip()
+    if not line:
+        raise PickCancelled()
+
+    parts = line.split("\t")
+    try:
+        index = int(parts[0])
+    except ValueError:
+        fail(f"invalid fzf selection: {line!r}")
+
+    if index < 0 or index >= len(registry.launches):
+        fail(f"selection index out of range: {index}")
+
+    return registry.launches[index]
+
+
+def prepare(launch: Launch, ctx: OpenContext) -> ResolvedLaunch:
+    if isinstance(launch.cwd, CwdFocused):
+        if ctx.focused_cwd is None:
+            fail(
+                f'"{launch.name}" uses cwd policy "focused" but no focused directory was captured'
+            )
+        run_cwd = ctx.focused_cwd
+    elif isinstance(launch.cwd, CwdFixed):
+        run_cwd = launch.cwd.directory
+    else:
+        run_cwd = _home()
+
+    if not os.path.isdir(run_cwd):
+        fail(f"working directory does not exist: {run_cwd}")
+
+    argv = list(launch.argv)
+    exe = argv[0]
+    if not os.path.isabs(exe):
+        found = find_in_path(exe)
+        if found is None:
+            fail(f'command not found: {exe!r} (for launch "{launch.name}")')
+        argv[0] = found
+    elif not os.path.isfile(exe):
+        fail(f"command not found: {exe!r}")
+
+    return ResolvedLaunch(
+        argv=tuple(argv),
+        cwd=run_cwd,
+        keep_open=launch.keep_open,
+        display_name=launch.name,
+    )
+
+
+def exec_prepared(resolved: ResolvedLaunch) -> None:
+    os.chdir(resolved.cwd)
+    if not resolved.keep_open:
+        os.execv(resolved.argv[0], list(resolved.argv))
+
+    try:
+        completed = subprocess.run(list(resolved.argv))
+        code = completed.returncode
+    except OSError as e:
+        fail(f"failed to run {resolved.argv[0]!r}: {e}")
+        return
+
+    if code != 0:
+        print(f"\nExit code {code}", flush=True)
+    wait_for_enter()
+    raise SystemExit(0)
+
+
+def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if argv[:1] == ["--validate-config"]:
+        path = config_path()
+        try:
+            reg = load_registry(path)
+        except ConfigError as e:
+            print(f"invalid: {e}", file=sys.stderr)
+            raise SystemExit(1) from e
+        print(f"ok: {len(reg.launches)} launch(es) in {path}")
+        raise SystemExit(0)
+
+    try:
+        ctx = parse_context(argv)
+    except SystemExit:
+        raise
+    except Exception as e:
+        fail(str(e))
+
+    path = config_path()
+    try:
+        registry = load_registry(path)
+    except ConfigError as e:
+        fail(
+            f"Quick launch config missing or invalid.\n\n"
+            f"Create {e.path}\n\n"
+            f"{e.message}"
+        )
+
+    try:
+        launch = pick(registry, ctx)
+    except PickCancelled:
+        raise SystemExit(0)
+
+    try:
+        resolved = prepare(launch, ctx)
+    except SystemExit:
+        raise
+    except Exception as e:
+        fail(str(e))
+
+    exec_prepared(resolved)
+
+
+if __name__ == "__main__":
+    main()
