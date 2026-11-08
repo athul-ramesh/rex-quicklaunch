@@ -62,10 +62,13 @@ Press the shortcut again while the float is open to raise and focus the existing
 | `name` | Row title in fzf |
 | `argv` | Argument vector exec’d without a shell |
 | `cwd.policy` | `focused` (pane dir at open time), `fixed` (`cwd.path`, `~` expanded), or `home` |
-| `keep_open` | If true, after the command exits wait for Enter before closing |
+| `keep_open` | In-picker behavior when `new_pane` is false; with `new_pane: true`, maps to Rex `exit.on_completion` (see below) |
+| `new_pane` | If true, open the command in a new floating pane and close this picker (default false) |
 | `label` | Optional extra column in the fzf row |
 
-`keep_open: false` replaces the helper process with the program (`execve`). `keep_open: true` runs the command and leaves output visible until you press Enter.
+`keep_open: false` replaces the helper process with the program (`execve`). `keep_open: true` runs the command in the picker and leaves output visible until you press Enter.
+
+With `new_pane: true`, Enter opens a separate floating pane for the command and dismisses the quick-launch picker. `keep_open: false` closes that pane when the command exits (`exit.on_completion`); `keep_open: true` keeps it open after exit so you can read output (same idea as an agent session).
 
 Launched programs inherit PATH with missing Homebrew and system fallback directories appended, so tools such as Neovim can also find dependencies like `fzf`. Commands run directly without loading shell startup files; custom PATH entries from your shell configuration require launching through that shell explicitly.
 
