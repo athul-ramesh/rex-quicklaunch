@@ -3,6 +3,7 @@
   "launches": [
     {
       "name": "lazygit",
+      "label": "git UI",
       "argv": ["lazygit"],
       "cwd": { "policy": "focused" }
     },
@@ -21,7 +22,6 @@
       "name": "agent-demo",
       "argv": ["/bin/sleep", "3600"],
       "cwd": { "policy": "focused" },
-      "new_pane": true,
       "keep_open": true
     }
   ]
