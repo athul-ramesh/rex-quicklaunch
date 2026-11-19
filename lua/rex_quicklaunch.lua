@@ -452,6 +452,62 @@ local function picker()
   return ui.pick
 end
 
+local DEFERRED_FOCUS_DELAY = 0.15
+
+local function shell_quote(value)
+  return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function rex_cli_path()
+  for _, dir in ipairs(search_dirs()) do
+    local candidate = dir .. "/rex"
+    if is_executable(candidate) then
+      return candidate
+    end
+  end
+  return nil
+end
+
+local function schedule_reclaim_float_focus(session_id, layer_id)
+  if type(session_id) ~= "string" or session_id == "" then
+    return
+  end
+  if type(layer_id) ~= "string" or layer_id == "" then
+    return
+  end
+  local exec = type(rex) == "table" and rex.exec or nil
+  if type(exec) ~= "function" and type(exec) ~= "table" then
+    return
+  end
+  if type(rex.json) ~= "table" or type(rex.json.encode) ~= "function" then
+    return
+  end
+  local cli = rex_cli_path()
+  if cli == nil then
+    if type(rex.log) == "function" then
+      rex.log("warn", "rex_quicklaunch: rex CLI not found; cannot schedule float focus")
+    end
+    return
+  end
+  local payload = rex.json.encode({
+    session_id = session_id,
+    layer_id = layer_id,
+    state = "normal",
+    focus = true,
+  })
+  local cmd = string.format(
+    "(sleep %.2f; %s api call -s %s session.set_layer_state %s) >/dev/null 2>&1 &",
+    DEFERRED_FOCUS_DELAY,
+    shell_quote(cli),
+    shell_quote(session_id),
+    shell_quote(payload)
+  )
+  local _, err = exec({ "/bin/sh", "-c", cmd })
+  if err ~= nil and type(rex.log) == "function" then
+    rex.log("warn", "rex_quicklaunch: could not schedule float focus: " .. tostring(err))
+  end
+end
+
 local function choose(launches, args, block_id)
   if args.name ~= nil then
     if type(args.name) ~= "string" or args.name == "" then
@@ -494,6 +550,7 @@ function M.open(ctx, args)
     fail("run this from a Rex session (a key or the command palette)")
   end
   args = args or {}
+  local used_palette = args.name == nil
   local path = config_path()
   local launches = load_launches(path)
   if #launches == 0 then
@@ -534,13 +591,14 @@ function M.open(ctx, args)
   if type(layer.block_ids) == "table" then
     block_id = layer.block_ids[1]
   end
-  -- rex.ui.pick restores focus to the pane that opened the palette after
-  -- the action continues. new_layer{ focus = true } alone loses that race.
-  if type(block_id) == "string" and block_id ~= "" then
+  if type(block_id) == "string" and block_id ~= "" and type(rex.session.focus_block) == "function" then
     local _, focus_err = rex.session.focus_block({ block_id = block_id })
-    if focus_err ~= nil then
+    if focus_err ~= nil and type(rex.log) == "function" then
       rex.log("warn", "rex_quicklaunch: could not focus " .. block_id .. ": " .. tostring(focus_err))
     end
+  end
+  if used_palette then
+    schedule_reclaim_float_focus(ctx.session_id, layer.layer_id)
   end
   return {
     layer_id = layer.layer_id,
