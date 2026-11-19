@@ -534,6 +534,14 @@ function M.open(ctx, args)
   if type(layer.block_ids) == "table" then
     block_id = layer.block_ids[1]
   end
+  -- rex.ui.pick restores focus to the pane that opened the palette after
+  -- the action continues. new_layer{ focus = true } alone loses that race.
+  if type(block_id) == "string" and block_id ~= "" then
+    local _, focus_err = rex.session.focus_block({ block_id = block_id })
+    if focus_err ~= nil then
+      rex.log("warn", "rex_quicklaunch: could not focus " .. block_id .. ": " .. tostring(focus_err))
+    end
+  end
   return {
     layer_id = layer.layer_id,
     block_id = block_id,

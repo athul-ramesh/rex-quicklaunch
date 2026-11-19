@@ -150,6 +150,10 @@ rex = {
       calls.layers[#calls.layers + 1] = request
       return { layer_id = "layer-1", block_ids = { "block-new-1" } }
     end,
+    focus_block = function(request)
+      calls.focuses[#calls.focuses + 1] = request
+      return { revision = 1 }
+    end,
   },
   layout = {
     block = function(spec)
@@ -176,6 +180,7 @@ local function begin(pick_fn)
   env.HOME = nil
   env.PATH = nil
   calls.layers = {}
+  calls.focuses = {}
   calls.picks = {}
   calls.block_methods = {}
   calls.pwd = { pwd = "file:///tmp" }
@@ -319,6 +324,11 @@ do
     check(result ~= nil and result.layer_id == "layer-1", "result names the layer")
     check(result ~= nil and result.block_id == "block-new-1", "result names the new block")
     check(result ~= nil and result.name == "echo", "result names the launch")
+    check(#calls.focuses == 1, "focuses the new float after open")
+    check(
+      calls.focuses[1] ~= nil and calls.focuses[1].block_id == "block-new-1",
+      "focus_block targets the new block"
+    )
   end
 end
 
