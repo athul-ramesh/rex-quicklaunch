@@ -1,90 +1,89 @@
 # rex-quicklaunch
 
-Floating fzf picker for CLI commands you define in JSON. One Rex shortcut opens the list in a pane; Enter runs the highlighted command in that same pane.
-
-## Dependencies
-
-- [Rex](https://rex.dev) server running
-- `fzf` (`brew install fzf`)
-- Python 3 (stdlib only in the helper)
+Quick Launch picks one command from your JSON list in the Rex command palette and runs it in a floating terminal.
 
 ## Install
+
+You need a Rex server and a Rex app that can show `rex.ui.pick`. Custom UI arrived in control API revision 17.
+
+Run these commands from this repository.
 
 ```bash
 mkdir -p ~/.config/rex
 ln -sf "$(pwd)/lua/rex_quicklaunch.lua" ~/.config/rex/rex_quicklaunch.lua
-ln -sf "$(pwd)/bin/rex-quicklaunch" ~/.config/rex/rex-quicklaunch
-chmod +x bin/rex-quicklaunch
 cp quicklaunch.example.json ~/.config/rex/quicklaunch.json
 ```
 
-Edit `~/.config/rex/quicklaunch.json` for your tools.
+Edit `~/.config/rex/quicklaunch.json` and put your commands in `launches`.
 
-Optional paths:
+When the config file is not `~/.config/rex/quicklaunch.json`, set `REX_QUICKLAUNCH_CONFIG` to its path.
 
-```bash
-export REX_QUICKLAUNCH_HELPER=/path/to/rex-quicklaunch
-export REX_QUICKLAUNCH_CONFIG=/path/to/quicklaunch.json
-```
-
-Add to `~/.config/rex/init.lua`:
+Add this to `~/.config/rex/init.lua`.
 
 ```lua
 require("rex_quicklaunch")
 rex.bind("cmd+shift+g", "rex_quicklaunch")
 ```
 
-Reload:
+Reload Rex.
 
 ```bash
 rex config reload
 ```
 
-## Usage
+## Run a launch
 
-Focus a terminal pane and press your binding, or run **Quick Launch…** from the command palette. Enter runs the selected launch. Esc cancels and closes the helper.
+Focus a terminal pane when the command uses the focused directory.
 
-From a live session:
+Press the bound key, or choose **Quick Launch…** in the command palette.
+
+Choose a row. Press Esc to cancel.
+
+Rex focuses a new floating terminal and runs the command there. The working directory comes from `cwd.policy`. When `keep_open` is false, the float closes after the command exits. When `keep_open` is true, the float stays open after the command exits.
+
+To run one launch with no palette prompt, from a live session:
 
 ```bash
-rex -C "Mac mini" do -s "$REX_SESSION" rex_quicklaunch
+rex do -s "$REX_SESSION" rex_quicklaunch name=htop
 ```
 
-Press the shortcut again while the float is open to raise and focus the existing picker (the in-memory fzf state is unchanged; focused cwd was captured when the pane was created).
+`name` is that launch's `name`.
+
+## What a launch does
+
+The list is the command palette. Every launch opens one floating terminal.
+
+Older versions of this plugin opened an fzf list in a floating pane. Enter either replaced that pane with the command, or opened a second float when `new_pane` was true. Config files from that version still load. `new_pane` is accepted and ignored, because there is no picker pane left to replace or dismiss.
+
+`keep_open` false sets `exit.on_completion`, and the float closes when the command exits. `keep_open` true leaves the float open so you can read the output. The old "Press Enter to close" step is gone.
+
+`cwd.policy` `focused` uses the focused terminal's directory at the moment you confirm the row. `fixed` uses `cwd.path`, and a leading `~` expands to your home directory. `home` uses your home directory.
+
+`argv` runs with no shell. When the first argument contains no `/`, Rex looks it up on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`, and the Rex Server executable directory. When the first argument contains `/`, it is a file path. An absolute path is used as given. A relative path is resolved from the working directory. Shell startup files are not loaded. The float receives that same directory list as `path_prepend`, so programs the command starts can be found the same way.
 
 ## Config
 
-`~/.config/rex/quicklaunch.json` (see `quicklaunch.example.json`):
+The config file is `~/.config/rex/quicklaunch.json`. The sample is `quicklaunch.example.json`.
 
 | Field | Meaning |
 | --- | --- |
-| `version` | Must be `1` |
-| `name` | Row title in fzf |
-| `argv` | Argument vector exec’d without a shell |
-| `cwd.policy` | `focused` (pane dir at open time), `fixed` (`cwd.path`, `~` expanded), or `home` |
-| `keep_open` | In-picker behavior when `new_pane` is false; with `new_pane: true`, maps to Rex `exit.on_completion` (see below) |
-| `new_pane` | If true, open the command in a new floating pane and close this picker (default false) |
-| `label` | Optional extra column in the fzf row |
+| `version` | The number `1`. |
+| `launches` | Array of launch objects, in palette order. |
+| `name` | Required. Unique. Row title, and the id the palette returns. |
+| `label` | Optional second line on the row. |
+| `argv` | Required. Non-empty array of non-empty strings. |
+| `cwd.policy` | `focused`, `fixed`, or `home`. |
+| `cwd.path` | Required for `fixed`. Not allowed for `focused` or `home`. |
+| `keep_open` | Optional boolean. Default false. |
+| `new_pane` | Optional boolean. Accepted and ignored. |
 
-`keep_open: false` replaces the helper process with the program (`execve`). `keep_open: true` runs the command in the picker and leaves output visible until you press Enter.
+A missing file, invalid JSON, an unknown key, a missing working directory, or a missing command fails the action with an error. Cancelling the palette does nothing.
 
-With `new_pane: true`, Enter opens a separate floating pane for the command and dismisses the quick-launch picker. `keep_open: false` closes that pane when the command exits (`exit.on_completion`); `keep_open: true` keeps it open after exit so you can read output (same idea as an agent session).
-
-Launched programs inherit PATH with missing `~/.local/bin`, Homebrew, and system fallback directories appended, so tools such as `claude` or Neovim can resolve without a login shell. Commands run directly without loading shell startup files; custom PATH entries from your shell configuration require launching through that shell explicitly.
-
-## Development
-
-```bash
-python3 -m py_compile bin/rex-quicklaunch
-python3 bin/rex-quicklaunch --help
-REX_QUICKLAUNCH_CONFIG="$(pwd)/quicklaunch.example.json" \
-  python3 bin/rex-quicklaunch --validate-config
-```
-
-Check Lua syntax (when `luac` is available):
+## Check
 
 ```bash
 luac -p lua/rex_quicklaunch.lua
+lua test/quicklaunch_test.lua
 ```
 
-Do not load `lua/rex_quicklaunch.lua` with `rex do … --action` on the module table. Use `require("rex_quicklaunch")` in `init.lua`, then `rex do rex_quicklaunch` from a live session.
+Load the module from `init.lua` with `require("rex_quicklaunch")`. Run it from a live session with `rex do rex_quicklaunch`.
