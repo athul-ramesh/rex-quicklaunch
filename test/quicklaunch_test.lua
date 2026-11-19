@@ -17,6 +17,15 @@ if type(tmp) ~= "string" or tmp == "" then
   error("mktemp failed", 0)
 end
 
+local fake_bin = tmp .. "/rexbin"
+run("mkdir -p " .. sh_quote(fake_bin))
+do
+  local file = assert(io.open(fake_bin .. "/rex", "w"))
+  file:write("#!/bin/sh\nexit 0\n")
+  file:close()
+end
+run("chmod +x " .. sh_quote(fake_bin .. "/rex"))
+
 local decoder = tmp .. "/json_to_lua.py"
 do
   local file = assert(io.open(decoder, "w"))
@@ -125,12 +134,42 @@ local calls = { layers = {}, picks = {} }
 local action
 
 rex = {
-  json = { decode = decode_json },
+  json = {
+    decode = decode_json,
+    encode = function(value)
+      local function enc(v)
+        local t = type(v)
+        if t == "string" then
+          return string.format("%q", v):gsub("\n", "n")
+        end
+        if t == "boolean" then
+          return v and "true" or "false"
+        end
+        if t == "number" then
+          return tostring(v)
+        end
+        if t ~= "table" then
+          error("unsupported json.encode type " .. t)
+        end
+        local parts = {}
+        for k, item in pairs(v) do
+          parts[#parts + 1] = string.format("%q", k) .. ":" .. enc(item)
+        end
+        table.sort(parts)
+        return "{" .. table.concat(parts, ",") .. "}"
+      end
+      return enc(value)
+    end,
+  },
   action = function(spec)
     action = spec
   end,
   exec = setmetatable({}, {
     __call = function(_, argv)
+      if argv[1] == "/bin/sh" and argv[2] == "-c" then
+        calls.reclaims[#calls.reclaims + 1] = argv[3]
+        return { ok = true, code = 0, stdout = "", stderr = "" }
+      end
       if argv[1] ~= "/bin/test" then
         return nil, "unexpected command"
       end
@@ -155,6 +194,7 @@ rex = {
       return { revision = 1 }
     end,
   },
+  log = function() end,
   layout = {
     block = function(spec)
       return spec
@@ -178,9 +218,10 @@ local ctx = { session_id = "sess-1", block_id = "block-1" }
 local function begin(pick_fn)
   env.REX_QUICKLAUNCH_CONFIG = nil
   env.HOME = nil
-  env.PATH = nil
+  env.PATH = fake_bin
   calls.layers = {}
   calls.focuses = {}
+  calls.reclaims = {}
   calls.picks = {}
   calls.block_methods = {}
   calls.pwd = { pwd = "file:///tmp" }
@@ -324,11 +365,17 @@ do
     check(result ~= nil and result.layer_id == "layer-1", "result names the layer")
     check(result ~= nil and result.block_id == "block-new-1", "result names the new block")
     check(result ~= nil and result.name == "echo", "result names the launch")
-    check(#calls.focuses == 1, "focuses the new float after open")
+    check(#calls.focuses == 1, "sync focus_block after open")
     check(
       calls.focuses[1] ~= nil and calls.focuses[1].block_id == "block-new-1",
       "focus_block targets the new block"
     )
+    check(#calls.reclaims == 1, "schedules a background float focus reclaim")
+    local reclaim = calls.reclaims[1] or ""
+    check(reclaim:find("session.set_layer_state", 1, true) ~= nil, "reclaim calls set_layer_state")
+    check(reclaim:find("layer%-1", 1, false) ~= nil or reclaim:find("layer-1", 1, true) ~= nil, "reclaim names the new layer")
+    check(reclaim:find("sess%-1", 1, false) ~= nil or reclaim:find("sess-1", 1, true) ~= nil, "reclaim names the session")
+    check(reclaim:find("sleep 0.15", 1, true) ~= nil, "reclaim sleeps past palette restore")
   end
 end
 
@@ -339,6 +386,7 @@ do
   if layout ~= nil then
     check(layout.options.exit.on_completion == false, "keep_open leaves the float open")
     check(#calls.picks == 0, "name= skips the palette")
+    check(#calls.reclaims == 0, "name= skips background float reclaim")
   end
 end
 
