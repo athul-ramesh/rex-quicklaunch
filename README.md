@@ -55,7 +55,7 @@ The list is the command palette. Every launch opens one floating terminal.
 
 Older versions of this plugin opened an fzf list in a floating pane. Enter either replaced that pane with the command, or opened a second float when `new_pane` was true. Config files from that version still load. `new_pane` is accepted and ignored, because there is no picker pane left to replace or dismiss.
 
-`keep_open` false sets `exit.on_completion`, and the float closes when the command exits. `keep_open` true leaves the float open. A command that exits very quickly also leaves the float open, and the output stays on screen. The old "Press Enter to close" step is gone.
+`keep_open` false sets `exit.on_completion`, and the float closes when the command exits. `keep_open` true leaves the float open so you can read the output. The old "Press Enter to close" step is gone.
 
 `cwd.policy` `focused` uses the focused terminal's directory at the moment you confirm the row. `fixed` uses `cwd.path`, and a leading `~` expands to your home directory. `home` uses your home directory.
 

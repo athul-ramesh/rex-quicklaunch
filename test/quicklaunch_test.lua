@@ -148,7 +148,7 @@ rex = {
   session = {
     new_layer = function(request)
       calls.layers[#calls.layers + 1] = request
-      return { layer_id = "layer-1" }
+      return { layer_id = "layer-1", block_ids = { "block-new-1" } }
     end,
   },
   layout = {
@@ -177,7 +177,9 @@ local function begin(pick_fn)
   env.PATH = nil
   calls.layers = {}
   calls.picks = {}
+  calls.block_methods = {}
   calls.pwd = { pwd = "file:///tmp" }
+  calls.process = nil
   rex.ui = {
     pick = function(spec)
       calls.picks[#calls.picks + 1] = spec
@@ -188,8 +190,13 @@ local function begin(pick_fn)
     end,
   }
   rex.block = {
-    call = function(_, _, args)
+    call = function(_, method, args)
       calls.block_args = args
+      calls.block_methods = calls.block_methods or {}
+      calls.block_methods[#calls.block_methods + 1] = method
+      if method == "process" then
+        return calls.process
+      end
       return calls.pwd
     end,
   }
@@ -275,6 +282,10 @@ do
   local items = calls.picks[1] and calls.picks[1].items or {}
   check(#items == 4, "example shows 4 launches, got " .. tostring(#items))
   check(calls.picks[1].title == "Quick Launch", "palette title")
+  check(
+    calls.picks[1].placeholder == "Filter launches  ·  /tmp",
+    "placeholder shows focused cwd, got " .. tostring(calls.picks[1].placeholder)
+  )
   local lazygit = items[1]
   check(lazygit ~= nil and lazygit.id == "lazygit" and lazygit.title == "lazygit", "lazygit id and title")
   check(lazygit ~= nil and lazygit.subtitle == "git UI", "lazygit subtitle is the label")
@@ -289,7 +300,7 @@ begin(function()
 end)
 write_config(echo_json())
 do
-  local layout = opened(ctx, nil)
+  local layout, result = opened(ctx, nil)
   if layout ~= nil then
     local options = layout.options
     check(layout.label == "echo", "float label is the launch name")
@@ -305,6 +316,9 @@ do
       check(contains(options.path_prepend, real_home .. "/.local/bin"), "path_prepend includes ~/.local/bin")
     end
     check(#calls.picks == 1, "palette was shown")
+    check(result ~= nil and result.layer_id == "layer-1", "result names the layer")
+    check(result ~= nil and result.block_id == "block-new-1", "result names the new block")
+    check(result ~= nil and result.name == "echo", "result names the launch")
   end
 end
 
@@ -338,8 +352,33 @@ do
   local layout = opened(ctx, { name = "echo" })
   if layout ~= nil then
     check(layout.options.cwd == "/tmp", "focused cwd strips a file://host URL, got " .. tostring(layout.options.cwd))
+    check(contains(calls.block_methods, "process"), "focused cwd probes process first")
+    check(contains(calls.block_methods, "pwd"), "focused cwd falls back to pwd")
     check(layout.options.exit.on_completion == true, "new_pane true still closes when keep_open is false")
     check(#calls.layers == 1, "new_pane still opens one float")
+  end
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "echo",
+      "argv": ["/bin/echo", "hello"],
+      "cwd": { "policy": "focused" }
+    }
+  ]
+}
+]])
+calls.process = { foreground = { cwd = "file://Mac-mini.local/var" } }
+calls.pwd = { pwd = "file:///tmp" }
+do
+  local layout = opened(ctx, { name = "echo" })
+  if layout ~= nil then
+    check(layout.options.cwd == "/var", "process foreground cwd wins over pwd, got " .. tostring(layout.options.cwd))
+    check(not contains(calls.block_methods, "pwd"), "pwd is skipped when process cwd is usable")
   end
 end
 

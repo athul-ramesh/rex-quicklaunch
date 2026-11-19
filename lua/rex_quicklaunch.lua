@@ -352,7 +352,26 @@ local function focused_directory(block_id)
   if type(rex.block) ~= "table" or type(rex.block.call) ~= "function" then
     return nil
   end
-  local info = rex.block.call("com.superlogical.terminal", "pwd", {
+  -- Prefer the foreground process cwd when Rex exposes it, then the
+  -- terminal pwd. Both may arrive as file:// URLs.
+  local info = rex.block.call("com.superlogical.terminal", "process", {
+    block_id = block_id,
+  })
+  if type(info) == "table" then
+    local fg = info.foreground or {}
+    local child = info.child or {}
+    local cwd = fg.cwd or child.cwd
+    if type(cwd) == "string" and cwd ~= "" then
+      local stripped = absolute_path_from_file_url(cwd)
+      if stripped ~= nil then
+        return stripped
+      end
+      if cwd:sub(1, 1) == "/" then
+        return cwd
+      end
+    end
+  end
+  info = rex.block.call("com.superlogical.terminal", "pwd", {
     block_id = block_id,
   })
   if type(info) ~= "table" then
@@ -433,7 +452,7 @@ local function picker()
   return ui.pick
 end
 
-local function choose(launches, args)
+local function choose(launches, args, block_id)
   if args.name ~= nil then
     if type(args.name) ~= "string" or args.name == "" then
       fail("name must be a non-empty string")
@@ -444,9 +463,14 @@ local function choose(launches, args)
   if pick == nil then
     fail("custom UI is unavailable (rex.ui.pick). Update the Rex app")
   end
+  local placeholder = "Filter launches"
+  local cwd_note = focused_directory(block_id)
+  if cwd_note ~= nil then
+    placeholder = placeholder .. "  ·  " .. cwd_note
+  end
   local id, why, detail = pick({
     title = "Quick Launch",
-    placeholder = "Filter launches",
+    placeholder = placeholder,
     items = pick_items(launches),
   })
   if id == nil then
@@ -476,7 +500,7 @@ function M.open(ctx, args)
     bad(path, "no launches")
   end
 
-  local name = choose(launches, args)
+  local name = choose(launches, args, ctx.block_id)
   if name == nil then
     return nil
   end
@@ -506,8 +530,13 @@ function M.open(ctx, args)
   if layer == nil then
     fail("could not open a terminal: " .. tostring(err))
   end
+  local block_id = nil
+  if type(layer.block_ids) == "table" then
+    block_id = layer.block_ids[1]
+  end
   return {
     layer_id = layer.layer_id,
+    block_id = block_id,
     name = launch.name,
   }
 end
