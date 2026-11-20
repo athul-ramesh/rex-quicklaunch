@@ -130,7 +130,18 @@ os.getenv = function(name)
   return real_getenv(name)
 end
 
-local calls = { layers = {}, picks = {} }
+local calls = {
+  layers = {},
+  picks = {},
+  splits = {},
+  views = {},
+  inputs = {},
+  binds = {},
+  raises = {},
+  reclaims = {},
+  focuses = {},
+  bind_logs = {},
+}
 local action
 
 rex = {
@@ -184,23 +195,63 @@ rex = {
       return { ok = yes, code = yes and 0 or 1, stdout = "", stderr = "" }
     end,
   }),
+  bind = function(key, action_name, args)
+    calls.binds[#calls.binds + 1] = { key = key, action = action_name, args = args }
+  end,
   session = {
     new_layer = function(request)
       calls.layers[#calls.layers + 1] = request
       return { layer_id = "layer-1", block_ids = { "block-new-1" } }
+    end,
+    new_split = function(request)
+      calls.splits[#calls.splits + 1] = request
+      return { layer_id = "split-1", block_ids = { "block-split-1" } }
+    end,
+    view = function(request)
+      calls.views[#calls.views + 1] = request
+      if calls.view_result == nil then
+        return nil, "no view"
+      end
+      return calls.view_result
+    end,
+    raise_layer = function(request)
+      calls.raises[#calls.raises + 1] = request
+      return { revision = 1 }
     end,
     focus_block = function(request)
       calls.focuses[#calls.focuses + 1] = request
       return { revision = 1 }
     end,
   },
-  log = function() end,
+  log = function(level, message)
+    if type(message) == "string" and message:find("bind", 1, true) then
+      calls.bind_logs[#calls.bind_logs + 1] = message
+    end
+  end,
   layout = {
     block = function(spec)
       return spec
     end,
   },
 }
+
+do
+  local stub = tmp .. "/module-load.json"
+  local file = assert(io.open(stub, "w"))
+  file:write([[{
+  "version": 1,
+  "launches": [
+    {
+      "name": "noop",
+      "argv": ["/bin/true"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "key": "cmd+shift+z"
+    }
+  ]
+}]])
+  file:close()
+  env.REX_QUICKLAUNCH_CONFIG = stub
+end
 
 local M = dofile(root .. "/lua/rex_quicklaunch.lua")
 
@@ -213,6 +264,11 @@ local function check(cond, message)
   io.stderr:write("FAIL: " .. message .. "\n")
 end
 
+check(
+  #calls.binds == 1 and calls.binds[1].key == "cmd+shift+z" and calls.binds[1].args.name == "noop",
+  "register launch key at module load"
+)
+
 local ctx = { session_id = "sess-1", block_id = "block-1" }
 
 local function begin(pick_fn)
@@ -220,9 +276,15 @@ local function begin(pick_fn)
   env.HOME = nil
   env.PATH = fake_bin
   calls.layers = {}
+  calls.splits = {}
   calls.focuses = {}
   calls.reclaims = {}
   calls.picks = {}
+  calls.views = {}
+  calls.inputs = {}
+  calls.raises = {}
+  calls.view_result = nil
+  calls.input_fn = nil
   calls.block_methods = {}
   calls.pwd = { pwd = "file:///tmp" }
   calls.process = nil
@@ -233,6 +295,13 @@ local function begin(pick_fn)
         return nil, "cancelled"
       end
       return pick_fn(spec)
+    end,
+    input = function(spec)
+      calls.inputs[#calls.inputs + 1] = spec
+      if calls.input_fn == nil then
+        return nil, "cancelled"
+      end
+      return calls.input_fn(spec)
     end,
   }
   rex.block = {
@@ -287,7 +356,25 @@ local function opened(call_ctx, args)
     return nil
   end
   check(layer.layout.flavor == "com.superlogical.terminal.shell", "terminal flavor")
+  check(result ~= nil and result.reused == false, "fresh open is not reused")
   return layer.layout, result
+end
+
+local function opened_split(call_ctx, args)
+  local ok, result = pcall(M.open, call_ctx, args)
+  if not ok then
+    check(false, "open failed: " .. tostring(result))
+    return nil
+  end
+  if #calls.splits ~= 1 then
+    check(false, "expected one split, got " .. tostring(#calls.splits))
+    return nil
+  end
+  check(#calls.layers == 0, "split does not create a float")
+  local split = calls.splits[1]
+  check(split.focus == true, "split is focused")
+  check(split.anchor_id == call_ctx.block_id, "split anchors on focused block")
+  return split.layout, result
 end
 
 local function contains(list, value)
@@ -326,7 +413,7 @@ do
   check(#calls.layers == 0, "cancel opens no float")
   check(#calls.picks == 1, "cancel still shows the palette")
   local items = calls.picks[1] and calls.picks[1].items or {}
-  check(#items == 4, "example shows 4 launches, got " .. tostring(#items))
+  check(#items == 5, "example shows 5 launches, got " .. tostring(#items))
   check(calls.picks[1].title == "Quick Launch", "palette title")
   check(
     calls.picks[1].placeholder == "Filter launches  ·  /tmp",
@@ -339,6 +426,7 @@ do
   check(items[2] ~= nil and items[2].id == "build" and items[2].subtitle == nil, "build has no subtitle")
   check(items[3] ~= nil and items[3].id == "htop" and items[3].icon == "terminal", "htop row")
   check(items[4] ~= nil and items[4].id == "agent-demo", "agent-demo row")
+  check(items[5] ~= nil and items[5].id == "notes", "notes row")
 end
 
 begin(function()
@@ -706,12 +794,422 @@ begin()
 write_config(echo_json())
 expect_error(ctx, { name = "nope" }, "no launch named nope")
 
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "split",
+      "argv": ["/bin/echo", "hi"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "place": "right"
+    }
+  ]
+}
+]])
+do
+  local layout, result = opened_split(ctx, { name = "split" })
+  if layout ~= nil then
+    check(calls.splits[1].direction == "horizontal", "right split is horizontal")
+    check(calls.splits[1].side == "after", "right split is after")
+    check(result ~= nil and result.block_id == "block-split-1", "split returns block id")
+  end
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "split",
+      "argv": ["/bin/echo"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "place": "right",
+      "bounds": { "x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5 }
+    }
+  ]
+}
+]])
+expect_error(ctx, { name = "split" }, "bounds is not allowed when place is a split")
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "big",
+      "argv": ["/bin/echo"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "bounds": { "x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8 }
+    }
+  ]
+}
+]])
+do
+  local layout = opened(ctx, { name = "big" })
+  if layout ~= nil then
+    local bounds = calls.layers[1].bounds
+    check(bounds ~= nil and bounds.w == 0.8, "custom bounds width")
+    check(bounds.x == 0.1 and bounds.h == 0.8, "custom bounds box")
+  end
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "claude",
+      "argv": ["/bin/echo", "agent"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "reuse": true
+    }
+  ]
+}
+]])
+calls.view_result = {
+  windows = {
+    {
+      layers = {
+        {
+          layer_id = "layer-existing",
+          kind = "float",
+          blocks = {
+            {
+              block_id = "block-existing",
+              label = "claude",
+              flavor = "com.superlogical.terminal.shell",
+            },
+          },
+        },
+      },
+    },
+  },
+}
+do
+  local ok, result = pcall(M.open, ctx, { name = "claude" })
+  check(ok and result ~= nil and result.reused == true, "reuse hit")
+  check(result ~= nil and result.block_id == "block-existing", "reuse block id")
+  check(#calls.layers == 0 and #calls.splits == 0, "reuse does not create a pane")
+  check(#calls.focuses == 1 and calls.focuses[1].block_id == "block-existing", "reuse focuses block")
+  check(#calls.raises == 1, "reuse raises float layer")
+  check(#calls.views == 1 and calls.views[1].session_id == "sess-1", "reuse passes session_id to view")
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "claude",
+      "argv": ["/bin/echo"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "reuse": true
+    }
+  ]
+}
+]])
+calls.view_result = { windows = { { layers = { { blocks = {} } } } } }
+do
+  local layout = opened(ctx, { name = "claude" })
+  check(layout ~= nil, "reuse miss creates a float")
+  check(#calls.views == 1, "reuse miss still lists panes")
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "dup",
+      "argv": ["/bin/echo"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "reuse": true
+    }
+  ]
+}
+]])
+calls.view_result = {
+  windows = {
+    {
+      layers = {
+        {
+          kind = "tiled",
+          blocks = {
+            { block_id = "b1", label = "dup", flavor = "com.superlogical.terminal.shell" },
+            { block_id = "b2", label = "dup", flavor = "com.superlogical.terminal.shell" },
+          },
+        },
+      },
+    },
+  },
+}
+expect_error(ctx, { name = "dup" }, "more than one pane named")
+check(#calls.layers == 0, "ambiguous reuse creates nothing")
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "notes",
+      "argv": ["/bin/echo", "{{line}}"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "prompt": [{ "id": "line", "title": "First line", "default": "# " }],
+      "initial_input": "{{line}}\n"
+    }
+  ]
+}
+]])
+calls.input_fn = function(spec)
+  check(spec.value == "# ", "ui.input receives default prefill")
+  return "hello"
+end
+do
+  local layout = opened(ctx, { name = "notes" })
+  if layout ~= nil then
+    check(layout.options.command[2] == "hello", "argv placeholder substituted")
+    check(layout.options.initial_input == "hello\n", "initial_input substituted")
+    check(#calls.inputs == 1, "one prompt")
+  end
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "ask",
+      "argv": ["/bin/echo", "{{x}}"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "prompt": [{ "id": "x", "title": "Value", "required": false }]
+    }
+  ]
+}
+]])
+calls.input_fn = function()
+  return ""
+end
+do
+  local layout = opened(ctx, { name = "ask" })
+  if layout ~= nil then
+    check(layout.options.command[2] == "", "optional empty prompt substitutes empty string")
+  end
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "ask",
+      "argv": ["/bin/echo", "{{x}}"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "prompt": [{ "id": "x", "title": "Value" }]
+    }
+  ]
+}
+]])
+calls.input_fn = nil
+do
+  local ok, result = pcall(M.open, ctx, { name = "ask" })
+  check(ok and result == nil, "prompt cancel returns nil, got " .. tostring(result))
+  check(#calls.layers == 0, "prompt cancel creates nothing")
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "reuse-notes",
+      "argv": ["/bin/echo", "{{line}}"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "reuse": true,
+      "prompt": [{ "id": "line", "title": "Line" }]
+    }
+  ]
+}
+]])
+calls.view_result = {
+  windows = {
+    {
+      layers = {
+        {
+          layer_id = "layer-x",
+          kind = "float",
+          blocks = {
+            { block_id = "block-x", label = "reuse-notes", flavor = "com.superlogical.terminal.shell" },
+          },
+        },
+      },
+    },
+  },
+}
+do
+  local ok, result = pcall(M.open, ctx, { name = "reuse-notes" })
+  check(ok and result ~= nil and result.reused == true, "reuse before prompt")
+  check(#calls.inputs == 0, "reuse hit skips prompts")
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "filter",
+      "argv": ["/bin/echo"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "reuse": true
+    }
+  ]
+}
+]])
+calls.view_result = {
+  windows = {
+    {
+      layers = {
+        {
+          layer_id = "layer-bad",
+          kind = "tiled",
+          blocks = {
+            { block_id = "editor-1", label = "filter", flavor = "com.superlogical.editor" },
+            {
+              block_id = "shell-1",
+              label = "filter",
+              flavor = "com.superlogical.terminal.shell",
+            },
+          },
+        },
+      },
+    },
+  },
+}
+do
+  local ok, result = pcall(M.open, ctx, { name = "filter" })
+  check(ok and result ~= nil and result.reused == true, "reuse ignores non-shell flavor")
+  check(result ~= nil and result.block_id == "shell-1", "reuse picks shell block")
+end
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "a",
+      "argv": ["/bin/echo"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "key": "cmd+a"
+    },
+    {
+      "name": "b",
+      "argv": ["/bin/echo"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "key": "cmd+a"
+    }
+  ]
+}
+]])
+expect_error(ctx, { name = "a" }, "duplicate key: cmd+a")
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "bad-prompt",
+      "argv": ["/bin/echo", "{{nope}}"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "prompt": [{ "id": "line", "title": "Line" }]
+    }
+  ]
+}
+]])
+expect_error(ctx, { name = "bad-prompt" }, "unknown placeholder")
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "unused",
+      "argv": ["/bin/echo"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "prompt": [{ "id": "line", "title": "Line" }]
+    }
+  ]
+}
+]])
+expect_error(ctx, { name = "unused" }, "unused prompt")
+
+begin()
+write_config([[
+{
+  "version": 1,
+  "launches": [
+    {
+      "name": "split",
+      "argv": ["/bin/echo"],
+      "cwd": { "policy": "fixed", "path": "/tmp" },
+      "place": "left"
+    }
+  ]
+}
+]])
+expect_error({ session_id = "sess-1" }, { name = "split" }, "split placement needs a focused block")
+
+begin()
+env.REX_QUICKLAUNCH_CONFIG = tmp .. "/missing-bind.json"
+do
+  local helper = tmp .. "/require-no-throw.lua"
+  local file = assert(io.open(helper, "w"))
+  file:write(string.format([[
+rex = {
+  action = function() end,
+  bind = function() end,
+  log = function() end,
+}
+local getenv = os.getenv
+os.getenv = function(name)
+  if name == "REX_QUICKLAUNCH_CONFIG" then
+    return %q
+  end
+  if name == "HOME" then
+    return %q
+  end
+  return getenv(name)
+end
+local ok, err = pcall(dofile, %q)
+if not ok then
+  io.stderr:write(tostring(err))
+  os.exit(1)
+end
+]], tmp .. "/missing-bind.json", tmp, root .. "/lua/rex_quicklaunch.lua"))
+  file:close()
+  local cmd = "lua " .. sh_quote(helper)
+  check(os.execute(cmd) == true, "missing config does not throw on require")
+end
+
 check(action ~= nil, "action is registered")
 if action ~= nil then
   check(action.name == "rex_quicklaunch", "action name")
   check(action.title == "Quick Launch…", "action title")
   check(type(action.keywords) == "string" and action.keywords:find("fzf", 1, true) == nil, "keywords do not mention fzf")
-  check(type(action.description) == "string" and action.description:find("floating terminal", 1, true) ~= nil, "description names the float")
+  check(type(action.description) == "string" and action.description:find("terminal", 1, true) ~= nil, "description names the terminal")
   check(action.args ~= nil and action.args.name == "string?", "name argument is optional")
   begin()
   write_config(echo_json())

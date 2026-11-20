@@ -12,8 +12,33 @@ local LAUNCH_KEYS = {
   keep_open = true,
   label = true,
   new_pane = true,
+  place = true,
+  bounds = true,
+  reuse = true,
+  key = true,
+  prompt = true,
+  initial_input = true,
 }
 local CWD_KEYS = { policy = true, path = true }
+local BOUNDS_KEYS = { x = true, y = true, w = true, h = true }
+local PROMPT_KEYS = { id = true, title = true, placeholder = true, default = true, required = true }
+
+local PLACE_NAMES = {
+  float = true,
+  left = true,
+  right = true,
+  up = true,
+  down = true,
+}
+
+local PLACE_SPLIT = {
+  left = { direction = "horizontal", side = "before" },
+  right = { direction = "horizontal", side = "after" },
+  up = { direction = "vertical", side = "before" },
+  down = { direction = "vertical", side = "after" },
+}
+
+local PROMPT_ID_PATTERN = "^[A-Za-z_][A-Za-z0-9_]*$"
 
 local function fail(message)
   error("rex_quicklaunch: " .. message, 0)
@@ -68,8 +93,6 @@ local function fallback_dirs()
   return dirs
 end
 
--- PATH first, then the fallbacks that are not already on it. One list is
--- both the command lookup path and the float's path_prepend.
 local function search_dirs()
   local dirs = {}
   local seen = {}
@@ -93,7 +116,6 @@ local function search_dirs()
 end
 
 local function rex_test(flag, path)
-  -- rex.exec is a callable table in current Rex, and a function is enough too.
   local exec = type(rex) == "table" and rex.exec or nil
   if type(exec) ~= "function" and type(exec) ~= "table" then
     fail("cannot check " .. path .. " (rex.exec is unavailable)")
@@ -187,6 +209,207 @@ local function parse_cwd(entry, path, index, name)
   return { policy = policy }
 end
 
+local function parse_place(entry, path, index, name)
+  local place = "float"
+  if entry.place ~= nil then
+    if type(entry.place) ~= "string" or PLACE_NAMES[entry.place] ~= true then
+      launch_bad(path, index, name, "place must be float, left, right, up, or down")
+    end
+    place = entry.place
+  end
+  return place
+end
+
+local function bounds_in_range(value)
+  return type(value) == "number" and value > 0 and value <= 1
+end
+
+local function parse_bounds(entry, path, index, name, place)
+  if entry.bounds == nil then
+    return { x = BOUNDS.x, y = BOUNDS.y, w = BOUNDS.w, h = BOUNDS.h }
+  end
+  if place ~= "float" then
+    launch_bad(path, index, name, "bounds is not allowed when place is a split")
+  end
+  local bounds = entry.bounds
+  if not is_object(bounds) then
+    launch_bad(path, index, name, "bounds must be an object")
+  end
+  local extra = unknown_key_list(bounds, BOUNDS_KEYS)
+  if #extra > 0 then
+    launch_bad(path, index, name, "bounds unknown keys: " .. table.concat(extra, ", "))
+  end
+  for _, key in ipairs({ "x", "y", "w", "h" }) do
+    if not bounds_in_range(bounds[key]) then
+      launch_bad(path, index, name, "bounds." .. key .. " must be a number in (0, 1]")
+    end
+  end
+  if bounds.x + bounds.w > 1 or bounds.y + bounds.h > 1 then
+    launch_bad(path, index, name, "bounds must fit in the unit square")
+  end
+  return { x = bounds.x, y = bounds.y, w = bounds.w, h = bounds.h }
+end
+
+local function parse_reuse(entry, path, index, name)
+  local reuse = false
+  if entry.reuse ~= nil then
+    if type(entry.reuse) ~= "boolean" then
+      launch_bad(path, index, name, "reuse must be a boolean")
+    end
+    reuse = entry.reuse
+  end
+  return reuse
+end
+
+local function parse_key(entry, path, index, name)
+  if entry.key == nil then
+    return nil
+  end
+  local key = entry.key
+  if type(key) ~= "string" or key == "" then
+    launch_bad(path, index, name, "key must be a non-empty string")
+  end
+  if key:match("^%s") or key:match("%s$") then
+    launch_bad(path, index, name, "key must not have leading or trailing whitespace")
+  end
+  if key:find(" ") then
+    launch_bad(path, index, name, "key must not contain spaces")
+  end
+  if key:find("%c") then
+    launch_bad(path, index, name, "key must not contain control characters")
+  end
+  return key
+end
+
+local function parse_initial_input(entry, path, index, name)
+  if entry.initial_input == nil then
+    return nil
+  end
+  local value = entry.initial_input
+  if type(value) ~= "string" then
+    launch_bad(path, index, name, "initial_input must be a string")
+  end
+  if value:find("%z") then
+    launch_bad(path, index, name, "initial_input must not contain NUL")
+  end
+  if value == "" then
+    return nil
+  end
+  return value
+end
+
+local function valid_prompt_id(id)
+  return type(id) == "string" and id:match(PROMPT_ID_PATTERN) ~= nil
+end
+
+local function validate_prompt_placeholders(texts, prompt_ids, path, index, name)
+  local used = {}
+  for id in pairs(prompt_ids) do
+    used[id] = false
+  end
+  for _, text in ipairs(texts) do
+    local pos = 1
+    while pos <= #text do
+      local start = text:find("{{", pos, true)
+      if start == nil then
+        break
+      end
+      local rest = text:sub(start + 2)
+      local close = rest:find("}}", 1, true)
+      if close == nil then
+        launch_bad(path, index, name, "unknown placeholder")
+      end
+      local id = rest:sub(1, close - 1)
+      if prompt_ids[id] ~= true then
+        launch_bad(path, index, name, "unknown placeholder")
+      end
+      used[id] = true
+      pos = start + 2 + close + 1
+    end
+  end
+  for id, seen in pairs(used) do
+    if not seen then
+      launch_bad(path, index, name, "unused prompt")
+    end
+  end
+end
+
+local function parse_prompt(entry, path, index, name, argv, initial_input)
+  local prompt = {}
+  if entry.prompt == nil then
+    return prompt
+  end
+  if not is_list(entry.prompt) then
+    launch_bad(path, index, name, "prompt must be an array")
+  end
+  local seen_ids = {}
+  for j, item in ipairs(entry.prompt) do
+    if not is_object(item) then
+      launch_bad(path, index, name, "prompt[" .. tostring(j) .. "] must be an object")
+    end
+    local extra = unknown_key_list(item, PROMPT_KEYS)
+    if #extra > 0 then
+      launch_bad(path, index, name, "prompt[" .. tostring(j) .. "] unknown keys: " .. table.concat(extra, ", "))
+    end
+    local id = item.id
+    if not valid_prompt_id(id) then
+      launch_bad(path, index, name, "prompt[" .. tostring(j) .. "] id must match [A-Za-z_][A-Za-z0-9_]*")
+    end
+    if seen_ids[id] then
+      launch_bad(path, index, name, "prompt id must be unique: " .. id)
+    end
+    seen_ids[id] = true
+    local title = item.title
+    if type(title) ~= "string" or title == "" then
+      launch_bad(path, index, name, "prompt[" .. tostring(j) .. "] title must be a non-empty string")
+    end
+    if title:find("[\t\n%z]") then
+      launch_bad(path, index, name, "prompt[" .. tostring(j) .. "] title must not contain tab, newline, or NUL")
+    end
+    local required = true
+    if item.required ~= nil then
+      if type(item.required) ~= "boolean" then
+        launch_bad(path, index, name, "prompt[" .. tostring(j) .. "] required must be a boolean")
+      end
+      required = item.required
+    end
+    local placeholder = nil
+    if item.placeholder ~= nil then
+      if type(item.placeholder) ~= "string" then
+        launch_bad(path, index, name, "prompt[" .. tostring(j) .. "] placeholder must be a string")
+      elseif item.placeholder ~= "" then
+        placeholder = item.placeholder
+      end
+    end
+    local default_value = nil
+    if item.default ~= nil then
+      if type(item.default) ~= "string" then
+        launch_bad(path, index, name, "prompt[" .. tostring(j) .. "] default must be a string")
+      elseif item.default ~= "" then
+        default_value = item.default
+      end
+    end
+    prompt[#prompt + 1] = {
+      id = id,
+      title = title,
+      placeholder = placeholder,
+      default = default_value,
+      required = required,
+    }
+  end
+  if #prompt > 0 then
+    local texts = {}
+    for _, part in ipairs(argv) do
+      texts[#texts + 1] = part
+    end
+    if initial_input ~= nil then
+      texts[#texts + 1] = initial_input
+    end
+    validate_prompt_placeholders(texts, seen_ids, path, index, name)
+  end
+  return prompt
+end
+
 local function parse_launch(entry, path, index)
   if not is_object(entry) then
     launch_bad(path, index, nil, "must be an object")
@@ -228,9 +451,6 @@ local function parse_launch(entry, path, index)
     keep_open = entry.keep_open
   end
 
-  -- new_pane belonged to the fzf pane (reuse it, or open another float).
-  -- The palette is the list now, so every launch is one float. Accept the
-  -- boolean so version-1 files still load, and do not store it.
   if entry.new_pane ~= nil and type(entry.new_pane) ~= "boolean" then
     launch_bad(path, index, name, "new_pane must be a boolean")
   end
@@ -245,12 +465,25 @@ local function parse_launch(entry, path, index)
     end
   end
 
+  local place = parse_place(entry, path, index, name)
+  local bounds = parse_bounds(entry, path, index, name, place)
+  local reuse = parse_reuse(entry, path, index, name)
+  local key = parse_key(entry, path, index, name)
+  local initial_input = parse_initial_input(entry, path, index, name)
+  local prompt = parse_prompt(entry, path, index, name, argv, initial_input)
+
   return {
     name = name,
     argv = argv,
     cwd = cwd,
     keep_open = keep_open,
     label = label,
+    place = place,
+    bounds = bounds,
+    reuse = reuse,
+    key = key,
+    prompt = prompt,
+    initial_input = initial_input,
   }
 end
 
@@ -288,12 +521,19 @@ local function load_launches(path)
 
   local launches = {}
   local seen = {}
+  local seen_keys = {}
   for index, entry in ipairs(decoded.launches) do
     local launch = parse_launch(entry, path, index)
     if seen[launch.name] then
       bad(path, "duplicate launch name: " .. launch.name)
     end
     seen[launch.name] = true
+    if launch.key ~= nil then
+      if seen_keys[launch.key] then
+        bad(path, "duplicate key: " .. launch.key)
+      end
+      seen_keys[launch.key] = true
+    end
     launches[#launches + 1] = launch
   end
   return launches
@@ -352,8 +592,6 @@ local function focused_directory(block_id)
   if type(rex.block) ~= "table" or type(rex.block.call) ~= "function" then
     return nil
   end
-  -- Prefer the foreground process cwd when Rex exposes it, then the
-  -- terminal pwd. Both may arrive as file:// URLs.
   local info = rex.block.call("com.superlogical.terminal", "process", {
     block_id = block_id,
   })
@@ -380,8 +618,173 @@ local function focused_directory(block_id)
   return absolute_path_from_file_url(info.pwd)
 end
 
-local function resolve_command(launch, cwd, dirs)
-  local exe = launch.argv[1]
+local function substitute_string(text, prompts, answers)
+  local result = text
+  for _, prompt in ipairs(prompts) do
+    local token = "{{" .. prompt.id .. "}}"
+    local answer = answers[prompt.id] or ""
+    local from = 1
+    local parts = {}
+    while true do
+      local at = result:find(token, from, true)
+      if at == nil then
+        parts[#parts + 1] = result:sub(from)
+        break
+      end
+      parts[#parts + 1] = result:sub(from, at - 1)
+      parts[#parts + 1] = answer
+      from = at + #token
+    end
+    result = table.concat(parts)
+  end
+  return result
+end
+
+local function ui_input()
+  local ok, ui = pcall(function()
+    return rex.ui
+  end)
+  if not ok or type(ui) ~= "table" or type(ui.input) ~= "function" then
+    return nil
+  end
+  return ui.input
+end
+
+local function ask_prompts(prompts)
+  local input = ui_input()
+  if input == nil then
+    fail("custom UI is unavailable (rex.ui.input). Update the Rex app")
+  end
+  local answers = {}
+  for _, prompt in ipairs(prompts) do
+    local request = { title = prompt.title }
+    if prompt.placeholder ~= nil then
+      request.placeholder = prompt.placeholder
+    end
+    if prompt.default ~= nil then
+      request.value = prompt.default
+    end
+    local value, why, detail = input(request)
+    if value == nil then
+      if why == "cancelled" then
+        return nil
+      end
+      local message = "input " .. tostring(why)
+      if type(detail) == "string" and detail ~= "" then
+        message = message .. ": " .. detail
+      end
+      fail(message)
+    end
+    if type(value) ~= "string" then
+      fail("input returned an unexpected result")
+    end
+    if value == "" and prompt.required then
+      fail("prompt " .. prompt.id .. " is required")
+    end
+    answers[prompt.id] = value
+  end
+  return answers
+end
+
+local function session_view(session_id)
+  if type(rex.session) ~= "table" or type(rex.session.view) ~= "function" then
+    return nil, "cannot list panes"
+  end
+  local view, err
+  if type(session_id) == "string" and session_id ~= "" then
+    view, err = rex.session.view({ session_id = session_id })
+  else
+    view, err = rex.session.view({})
+  end
+  if view == nil then
+    local message = "cannot list panes"
+    if type(err) == "string" and err ~= "" then
+      message = message .. ": " .. err
+    end
+    return nil, message
+  end
+  return view, nil
+end
+
+local function block_eligible(block, launch_name)
+  if type(block) ~= "table" then
+    return false
+  end
+  if block.label ~= launch_name then
+    return false
+  end
+  local flavor = block.flavor
+  if flavor == nil then
+    return true
+  end
+  return flavor == TERMINAL_SHELL
+end
+
+local function find_reuse_panes(session_id, launch_name)
+  local view, err = session_view(session_id)
+  if view == nil then
+    return nil, err
+  end
+  local hits = {}
+  local windows = view.windows
+  if type(windows) ~= "table" then
+    return hits
+  end
+  for _, window in ipairs(windows) do
+    if type(window) ~= "table" then
+      goto continue_window
+    end
+    local layers = window.layers
+    if type(layers) ~= "table" then
+      goto continue_window
+    end
+    for _, layer in ipairs(layers) do
+      if type(layer) ~= "table" then
+        goto continue_layer
+      end
+      local blocks = layer.blocks
+      if type(blocks) ~= "table" then
+        goto continue_layer
+      end
+      for _, block in ipairs(blocks) do
+        if block_eligible(block, launch_name) then
+          hits[#hits + 1] = {
+            block_id = block.block_id,
+            layer_id = layer.layer_id,
+            kind = layer.kind,
+          }
+        end
+      end
+      ::continue_layer::
+    end
+    ::continue_window::
+  end
+  return hits, nil
+end
+
+local function focus_reuse(hit)
+  if type(hit.layer_id) == "string" and hit.layer_id ~= "" and hit.kind ~= "tiled" then
+    if type(rex.session.raise_layer) == "function" then
+      local _, raise_err = rex.session.raise_layer({ layer_id = hit.layer_id })
+      if raise_err ~= nil and type(rex.log) == "function" then
+        rex.log("warn", "rex_quicklaunch: could not raise layer " .. hit.layer_id .. ": " .. tostring(raise_err))
+      end
+    end
+  end
+  if type(hit.block_id) ~= "string" or hit.block_id == "" then
+    fail("could not focus reused pane")
+  end
+  if type(rex.session.focus_block) ~= "function" then
+    fail("could not focus reused pane")
+  end
+  local _, focus_err = rex.session.focus_block({ block_id = hit.block_id })
+  if focus_err ~= nil then
+    fail("could not focus reused pane: " .. tostring(focus_err))
+  end
+end
+
+local function resolve_command(argv, launch_name, cwd, dirs)
+  local exe = argv[1]
   local resolved = exe
   if exe:find("/", 1, true) then
     if exe:sub(1, 1) ~= "/" then
@@ -405,19 +808,19 @@ local function resolve_command(launch, cwd, dirs)
       end
     end
     if resolved == nil then
-      fail("command not found: " .. exe .. " (launch " .. launch.name .. ")")
+      fail("command not found: " .. exe .. " (launch " .. launch_name .. ")")
     end
   end
   if not is_executable(resolved) then
-    fail("command not found: " .. exe .. " (launch " .. launch.name .. ")")
+    fail("command not found: " .. exe .. " (launch " .. launch_name .. ")")
   end
 
-  local argv = {}
-  for i, part in ipairs(launch.argv) do
-    argv[i] = part
+  local resolved_argv = {}
+  for i, part in ipairs(argv) do
+    resolved_argv[i] = part
   end
-  argv[1] = resolved
-  return argv
+  resolved_argv[1] = resolved
+  return resolved_argv
 end
 
 local function resolve_cwd(launch, block_id)
@@ -545,6 +948,24 @@ local function choose(launches, args, block_id)
   return id
 end
 
+local function build_layout(launch, argv, cwd, dirs, initial_input)
+  local options = {
+    command = argv,
+    cwd = cwd,
+    shell = "none",
+    exit = { on_completion = not launch.keep_open },
+    path_prepend = dirs,
+  }
+  if initial_input ~= nil then
+    options.initial_input = initial_input
+  end
+  return rex.layout.block({
+    flavor = TERMINAL_SHELL,
+    label = launch.name,
+    options = options,
+  })
+end
+
 function M.open(ctx, args)
   if type(ctx) ~= "table" or type(ctx.session_id) ~= "string" or ctx.session_id == "" then
     fail("run this from a Rex session (a key or the command palette)")
@@ -566,24 +987,87 @@ function M.open(ctx, args)
     fail("no launch named " .. name)
   end
 
+  if launch.reuse then
+    local hits, view_err = find_reuse_panes(ctx.session_id, launch.name)
+    if view_err ~= nil then
+      fail(view_err)
+    end
+    if #hits > 1 then
+      fail("more than one pane named " .. launch.name)
+    end
+    if #hits == 1 then
+      focus_reuse(hits[1])
+      if used_palette and hits[1].kind ~= "tiled" then
+        schedule_reclaim_float_focus(ctx.session_id, hits[1].layer_id)
+      end
+      return {
+        layer_id = hits[1].layer_id,
+        block_id = hits[1].block_id,
+        name = launch.name,
+        reused = true,
+      }
+    end
+  end
+
+  if launch.place ~= "float" then
+    if type(ctx.block_id) ~= "string" or ctx.block_id == "" then
+      fail("split placement needs a focused block")
+    end
+  end
+
+  local answers
+  if #launch.prompt > 0 then
+    answers = ask_prompts(launch.prompt)
+    if answers == nil then
+      return nil
+    end
+  else
+    answers = {}
+  end
+
+  local argv = {}
+  for i, part in ipairs(launch.argv) do
+    local substituted = substitute_string(part, launch.prompt, answers)
+    if substituted:find("%z") then
+      fail("substituted argv must not contain NUL")
+    end
+    argv[i] = substituted
+  end
+
+  local initial_input = nil
+  if launch.initial_input ~= nil then
+    initial_input = substitute_string(launch.initial_input, launch.prompt, answers)
+    if initial_input:find("%z") then
+      fail("substituted initial_input must not contain NUL")
+    end
+    if initial_input == "" then
+      initial_input = nil
+    end
+  end
+
   local cwd = resolve_cwd(launch, ctx.block_id)
   local dirs = search_dirs()
-  local argv = resolve_command(launch, cwd, dirs)
-  local layer, err = rex.session.new_layer({
-    bounds = BOUNDS,
-    focus = true,
-    layout = rex.layout.block({
-      flavor = TERMINAL_SHELL,
-      label = launch.name,
-      options = {
-        command = argv,
-        cwd = cwd,
-        shell = "none",
-        exit = { on_completion = not launch.keep_open },
-        path_prepend = dirs,
-      },
-    }),
-  })
+  argv = resolve_command(argv, launch.name, cwd, dirs)
+  local layout = build_layout(launch, argv, cwd, dirs, initial_input)
+
+  local layer
+  local err
+  if launch.place == "float" then
+    layer, err = rex.session.new_layer({
+      bounds = launch.bounds,
+      focus = true,
+      layout = layout,
+    })
+  else
+    local split = PLACE_SPLIT[launch.place]
+    layer, err = rex.session.new_split({
+      direction = split.direction,
+      side = split.side,
+      anchor_id = ctx.block_id,
+      focus = true,
+      layout = layout,
+    })
+  end
   if layer == nil then
     fail("could not open a terminal: " .. tostring(err))
   end
@@ -597,27 +1081,52 @@ function M.open(ctx, args)
       rex.log("warn", "rex_quicklaunch: could not focus " .. block_id .. ": " .. tostring(focus_err))
     end
   end
-  if used_palette then
+  if used_palette and launch.place == "float" then
     schedule_reclaim_float_focus(ctx.session_id, layer.layer_id)
   end
   return {
     layer_id = layer.layer_id,
     block_id = block_id,
     name = launch.name,
+    reused = false,
   }
+end
+
+local function register_key_binds()
+  if type(rex.bind) ~= "function" then
+    return
+  end
+  local ok, launches_or_err = pcall(function()
+    return load_launches(config_path())
+  end)
+  if not ok then
+    if type(rex.log) == "function" then
+      rex.log("warn", "rex_quicklaunch: skipped key bindings: " .. tostring(launches_or_err))
+    end
+    return
+  end
+  for _, launch in ipairs(launches_or_err) do
+    if launch.key ~= nil then
+      local bind_ok, bind_err = pcall(rex.bind, launch.key, "rex_quicklaunch", { name = launch.name })
+      if not bind_ok and type(rex.log) == "function" then
+        rex.log("warn", "rex_quicklaunch: could not bind " .. launch.key .. ": " .. tostring(bind_err))
+      end
+    end
+  end
 end
 
 if type(rex) == "table" and type(rex.action) == "function" then
   rex.action({
     name = "rex_quicklaunch",
     title = "Quick Launch…",
-    description = "Pick a configured command and run it in a floating terminal.",
+    description = "Pick a configured command and run it in a floating or split terminal.",
     keywords = "quicklaunch command run launch",
     args = { name = "string?" },
     run = function(ctx, args)
       return M.open(ctx, args)
     end,
   })
+  register_key_binds()
 end
 
 return M

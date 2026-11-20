@@ -5,7 +5,8 @@
       "name": "lazygit",
       "label": "git UI",
       "argv": ["lazygit"],
-      "cwd": { "policy": "focused" }
+      "cwd": { "policy": "focused" },
+      "bounds": { "x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8 }
     },
     {
       "name": "build",
@@ -22,7 +23,18 @@
       "name": "agent-demo",
       "argv": ["/bin/sleep", "3600"],
       "cwd": { "policy": "focused" },
-      "keep_open": true
+      "keep_open": true,
+      "place": "right",
+      "reuse": true,
+      "key": "cmd+shift+a"
+    },
+    {
+      "name": "notes",
+      "argv": ["/bin/zsh"],
+      "cwd": { "policy": "home" },
+      "keep_open": true,
+      "prompt": [{ "id": "line", "title": "First line", "default": "# " }],
+      "initial_input": "{{line}}\n"
     }
   ]
 }
