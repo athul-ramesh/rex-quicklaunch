@@ -93,8 +93,6 @@ local function fallback_dirs()
   return dirs
 end
 
--- PATH first, then the fallbacks that are not already on it. One list is
--- both the command lookup path and the float's path_prepend.
 local function search_dirs()
   local dirs = {}
   local seen = {}
@@ -118,7 +116,6 @@ local function search_dirs()
 end
 
 local function rex_test(flag, path)
-  -- rex.exec is a callable table in current Rex, and a function is enough too.
   local exec = type(rex) == "table" and rex.exec or nil
   if type(exec) ~= "function" and type(exec) ~= "table" then
     fail("cannot check " .. path .. " (rex.exec is unavailable)")
@@ -454,9 +451,6 @@ local function parse_launch(entry, path, index)
     keep_open = entry.keep_open
   end
 
-  -- new_pane belonged to the fzf pane (reuse it, or open another float).
-  -- The palette is the list now, so every launch is one float. Accept the
-  -- boolean so version-1 files still load, and do not store it.
   if entry.new_pane ~= nil and type(entry.new_pane) ~= "boolean" then
     launch_bad(path, index, name, "new_pane must be a boolean")
   end
@@ -598,8 +592,6 @@ local function focused_directory(block_id)
   if type(rex.block) ~= "table" or type(rex.block.call) ~= "function" then
     return nil
   end
-  -- Prefer the foreground process cwd when Rex exposes it, then the
-  -- terminal pwd. Both may arrive as file:// URLs.
   local info = rex.block.call("com.superlogical.terminal", "process", {
     block_id = block_id,
   })
@@ -688,9 +680,6 @@ local function ask_prompts(prompts)
     end
     if value == "" and prompt.required then
       fail("prompt " .. prompt.id .. " is required")
-    end
-    if value == "" then
-      value = ""
     end
     answers[prompt.id] = value
   end
@@ -1112,7 +1101,7 @@ local function register_key_binds()
   end)
   if not ok then
     if type(rex.log) == "function" then
-      rex.log("warn", "rex_quicklaunch: skipped key bindings")
+      rex.log("warn", "rex_quicklaunch: skipped key bindings: " .. tostring(launches_or_err))
     end
     return
   end
